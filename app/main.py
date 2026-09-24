@@ -30,6 +30,10 @@
   6 条已知反应（各含反应物、生成物、以 kJ 表示的反应焓），以精确有理
   数求已知反应计量向量的有符号（允许反向、分数倍）线性组合复现目标
   反应，返回各反应倍数、推导反应焓与合并抵消后的逐物种净系数；
+* ``POST /equilibrium/solve`` 理想溶液平衡组成：单个可逆反应 + 各参与
+  物种初始摩尔数（正）+ 体积 L + Kc（正），在配平系数确定的非负物料
+  进度区间内求 Qc=Kc 的唯一内点（初始 Qc>Kc 时进度为负），返回进度
+  （绝对误差上界 1e-9 mol）与各物种平衡摩尔数；
 * ``GET  /reactions/{reaction_id}``  按幂等 ID 取回结果；
 * ``GET  /health``   健康检查。
 """
@@ -48,6 +52,8 @@ from .models import (
     BalanceResponse,
     BlendRequest,
     BlendResponse,
+    EquilibriumRequest,
+    EquilibriumResponse,
     HessRequest,
     HessResponse,
     IsotopeEnvelopeRequest,
@@ -71,6 +77,7 @@ from .service import (
     process_analyze,
     process_balance,
     process_blend,
+    process_equilibrium,
     process_hess,
     process_isotope_envelope,
     process_reverse_plan,
@@ -323,6 +330,29 @@ async def thermochemistry_hess(request: HessRequest):
     status, payload = process_hess(
         request.target.model_dump(),
         [item.model_dump() for item in request.known_reactions],
+    )
+    return JSONResponse(status_code=status, content=payload)
+
+
+@app.post(
+    "/api/v1/equilibrium/solve",
+    response_model=EquilibriumResponse,
+    tags=["平衡"],
+    summary="理想溶液平衡组成：Qc=Kc 的唯一反应进度与各物种平衡摩尔数",
+    responses={
+        400: {"description": "化学式或初始量物种无法解析"},
+        409: {"description": "同侧重复物种 / 同一物种跨两侧重复"},
+        422: {"description": "无法唯一配平 / 初始量与参与物种不一一对应 / "
+              "初始摩尔数、体积或 Kc 非正或非法"},
+    },
+)
+async def equilibrium_solve(request: EquilibriumRequest):
+    status, payload = process_equilibrium(
+        request.reactants,
+        request.products,
+        [item.model_dump() for item in request.amounts],
+        request.volume_liters,
+        request.kc,
     )
     return JSONResponse(status_code=status, content=payload)
 

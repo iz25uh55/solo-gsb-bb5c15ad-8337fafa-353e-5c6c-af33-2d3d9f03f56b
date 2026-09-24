@@ -41,7 +41,13 @@
     以精确有理数求已知向量的有符号线性组合（允许反向与分数倍使用）复现
     目标反应，返回各已知反应倍数、推导出的目标反应焓与合并抵消后的逐物种
     净系数；目标不在张成空间时报不可推导，多种组合导出不同反应焓时报歧义；
-13. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
+13. `/equilibrium/solve` 做**理想溶液平衡组成**：提交单个可逆反应两侧物种、
+    各参与物种的初始摩尔数（正十进制字符串）、溶液体积（L）与浓度平衡
+    常数 Kc（正），复用唯一配平按计量系数确定双向反应进度的非负物料区间，
+    在区间内按各物种浓度的计量次方构造 Qc，以"浮点对数种子 + 精确有理数
+    包夹二分"求 Qc=Kc 的唯一内点（初始 Qc>Kc 时进度为负），返回进度
+    （绝对误差上界 1e-10 mol）与各物种平衡摩尔数；
+14. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
 
 ---
 
@@ -167,6 +173,25 @@ curl -X POST http://localhost:8000/api/v1/thermochemistry/hess \
   }'
 ```
 
+理想溶液平衡组成——H₂ + I₂ ⇌ 2HI，各物种初始 1 mol、体积 1 L、Kc = 64：
+平衡时反应进度 ξ = 0.7 mol（H₂/I₂ 各 0.3 mol、HI 2.4 mol）：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/equilibrium/solve \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reactants": ["H2", "I2"],
+    "products": ["HI"],
+    "amounts": [
+      {"species": "H2", "moles": "1"},
+      {"species": "I2", "moles": "1"},
+      {"species": "HI", "moles": "1"}
+    ],
+    "volume_liters": "1",
+    "kc": "64"
+  }'
+```
+
 ### 不用 Docker 的本地运行方式
 
 ```bash
@@ -179,7 +204,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 pip install -r requirements-dev.txt
-pytest          # 全部测试（解析器/配平/计量/库存/溶液/同位素/赫斯定律）
+pytest          # 全部测试（解析器/配平/计量/库存/溶液/同位素/赫斯定律/平衡组成）
 ```
 
 ---
@@ -199,6 +224,7 @@ pytest          # 全部测试（解析器/配平/计量/库存/溶液/同位素
 | POST | `/api/v1/solutions/blend` | 溶液配制：不超过 4 种母液 + 目标终体积与各溶质目标浓度 → 满足全部目标浓度的最小母液取用量、补水量与最终浓度 |
 | POST | `/api/v1/isotopes/envelope` | 同位素名义质量峰分布：化学式 + 每元素同位素质量数/丰度 → 按质量升序的全部名义质量峰（最简分数概率）与最高概率峰 |
 | POST | `/api/v1/thermochemistry/hess` | 赫斯定律反应焓推导：目标反应 + 至多 6 条已知反应（含 kJ 反应焓）→ 各反应倍数（可反向/分数倍）、推导反应焓与合并抵消后的逐物种净系数 |
+| POST | `/api/v1/equilibrium/solve` | 理想溶液平衡组成：可逆反应 + 各参与物种初始摩尔数（正）+ 体积 L + Kc（正）→ Qc=Kc 的唯一进度（允许负进度，绝对误差上界 1e-10 mol）与各物种平衡摩尔数 |
 | GET | `/api/v1/reactions/{reaction_id}` | 按幂等 ID 取回之前的结果 |
 | GET | `/health` | 健康检查 |
 
@@ -1127,7 +1153,111 @@ curl -X POST http://localhost:8000/api/v1/isotopes/envelope \
 重复调用得到完全一致的结果。离子反应同样适用（电子 `e-` 作为物种参与
 配平与抵消，如两个还原半反应组合为置换反应时 `e-` 净系数为 `"0"`）。
 
-### 2.12 幂等与查询
+### 2.12 理想溶液平衡组成 `POST /api/v1/equilibrium/solve`
+
+提交**单个可逆反应**两侧物种、每个参与物种（反应物 ∪ 生成物）的
+**初始摩尔数**、溶液**体积 V（L）**与**浓度平衡常数 Kc**，服务端在
+复用唯一配平后：
+
+* 以配平系数与各物种初始量确定反应进度 ξ 的**非负物料区间**
+  （反应物要求 n0 − νξ ≥ 0 给出上界、生成物要求 n0 + νξ ≥ 0 给出
+  下界，各初始量为正故下界严格为负、上界严格为正）；
+* 按各物种**浓度的计量次方**构造反应商
+
+      Qc(ξ) = ∏生成物 ((n0 + νξ)/V)^ν ÷ ∏反应物 ((n0 − νξ)/V)^ν
+
+  在可行开区间内 `d ln Qc/dξ = Σ ν²/(n±νξ) > 0`，**Qc 连续严格递增**
+  （端点极限 0 → ∞），因此 Qc = Kc 对任意 Kc > 0 **恰有一个内点解**；
+* 方向由初始反应商决定：`Qc(0) < Kc` 时 ξ > 0 正向进行；
+  **`Qc(0) > Kc` 时 ξ < 0（允许负进度，反应逆向进行）**；
+  恰相等时 ξ = 0、`direction = "at_equilibrium"`；
+* 求解先用 IEEE-754 浮点对数二分取得微秒级近似种子，再以**精确有理数
+  幂积比较**（全程不经过 `float`）在种子两侧构造包夹并二分到区间宽度
+  ≤ 1e-10 mol，返回进度与各物种初始量、净变化量、平衡摩尔数。即使根
+  紧贴物料边界（Kc 极端大/小），物料边界只作为虚拟符号端点、永不参与
+  除零评估，误差保证仍然成立。
+
+请求体字段：
+
+| 字段 | 约束 |
+| --- | --- |
+| `reactants` / `products` | 反应两侧化学式；各自不能有重复物种，且**同一物种不能同时出现在两侧**（Qc/Kc 幂积要求两侧物种不相交） |
+| `amounts` | 每个参与物种恰好一条 `{species, moles}` 记录，与规范化物种**一一对应**（等价写法可识别，无缺失/重复/未知物种）；`moles` 为**正**十进制字符串（不能为 0、负数或 JSON 数字） |
+| `volume_liters` | 溶液体积 V，**正**十进制字符串，单位 L（如 `"2.0"`、`"0.5"`、`"1e-3"`） |
+| `kc` | 浓度平衡常数 Kc，**正**十进制字符串（无量纲浓度幂积；如 `"64"`、`"1.6e-5"`） |
+
+`H2 + I2 ⇌ 2HI`、各 1 mol、V = 1 L、Kc = 64 时
+`(1+2ξ)/(1−ξ) = √64 = 8`，ξ = 0.7 mol：
+
+```json
+{
+  "reaction_id": "rxn_……",
+  "cached": false,
+  "normalized": {
+    "reactants": ["H2", "I2"],
+    "products": ["HI"],
+    "equation": "H2 + I2 -> 2HI"
+  },
+  "volume_liters": "1",
+  "kc": "64",
+  "initial_qc": "1",
+  "reaction_extent": {
+    "value": "0.7",
+    "unit": "mol",
+    "direction": "forward",
+    "absolute_error_bound": "0.0000000001",
+    "feasible_range": {"lower": "-0.5", "upper": "1", "unit": "mol"}
+  },
+  "reactants": [
+    {"input": "H2", "normalized": "H2", "coefficient": 1,
+     "initial_moles": "1", "delta_moles": "-0.7", "equilibrium_moles": "0.3"},
+    {"input": "I2", "normalized": "I2", "coefficient": 1,
+     "initial_moles": "1", "delta_moles": "-0.7", "equilibrium_moles": "0.3"}
+  ],
+  "products": [
+    {"input": "HI", "normalized": "HI", "coefficient": 2,
+     "initial_moles": "1", "delta_moles": "1.4", "equilibrium_moles": "2.4"}
+  ]
+}
+```
+
+字段说明：
+
+| 字段 | 含义 |
+| --- | --- |
+| `initial_qc` | 初始反应商 Qc(ξ=0)（十进制字符串）；与 `kc` 比较即得反应方向 |
+| `reaction_extent.value` | 平衡进度 ξ*（mol，按配平式方向）；正为正向、负为逆向、0 为初始即平衡 |
+| `reaction_extent.direction` | `forward` / `reverse` / `at_equilibrium` |
+| `reaction_extent.absolute_error_bound` | 返回进度与精确解的**绝对误差上界**（mol），`"0.0000000001"`（1e-10，严于接口承诺的 1e-9） |
+| `reaction_extent.feasible_range` | 按配平系数与初始摩尔确定的非负物料进度区间 `[lower, upper]`（lower<0、upper>0） |
+| `reactants[].delta_moles` / `products[].delta_moles` | 净变化 = 有符号计量系数 × ξ；反应物非正、生成物非负（逆向时相反） |
+| `*.equilibrium_moles` | 平衡摩尔数 = 初始 + 净变化（mol），恒非负 |
+
+逆向示例：同一体系 Kc = `0.015625`（= 1/64）时初始 Qc = 1 > Kc，
+`direction = "reverse"`、ξ = −7/17 ≈ `"-0.41176470588"` mol，反应物
+增加、HI 减少。初始 Qc 恰等于 Kc（如 PCl₅ ⇌ PCl₃ + Cl₂ 各 1 mol、
+V = 1 L、Kc = 1）时 ξ 恰为 `"0"`。
+
+误差与数值约定：进度无限小数按 12 位定点小数舍入输出（数量级远大于
+1 mol 时也保证**绝对**误差，而非相对误差）；各物种平衡摩尔数与
+`initial_qc` 等其它十进制值沿用 28 位有效数字银行家舍入规则，全程以
+精确 `Fraction` 比较 Qc 与 Kc，没有浮点归属歧义。
+
+错误响应：
+
+| 场景 | HTTP / code |
+| --- | --- |
+| 反应式或初始量物种化学式无法解析（`details.field=amounts.species`） | `400 FORMULA_PARSE_ERROR` |
+| 同侧物种重复，或同一物种跨反应两侧重复（`details.species`） | `409 DUPLICATE_SPECIES` |
+| 反应无法唯一配平 / 无法配平 | `422 NON_UNIQUE_BALANCE` / `IMPOSSIBLE_BALANCE` 等 |
+| 初始量缺失/重复/含非参与物种（`details.missing/duplicate/unknown`） | `422 INVALID_REQUEST` |
+| 初始摩尔数为 0、负数、NaN、非数字或 JSON 数字（`details.invalid_moles`） | `422 INVALID_REQUEST` |
+| 体积或 Kc 为 0、负数、NaN、非数字或 JSON 数字（`details.invalid_volume` / `invalid_kc`） | `422 INVALID_REQUEST` |
+
+`reaction_id` / `cached` 与其它接口共享同一规范化配平签名（平衡计算
+本身不单独缓存）；同一请求重复调用得到逐位一致的结果。
+
+### 2.13 幂等与查询
 
 * 幂等键与书写顺序、括号风格、空白以及电荷的等价写法无关，只取决于每一侧
   物种的 **（元素组成多重集, 电荷）**。
@@ -1198,8 +1328,8 @@ LCM），热循环只剩整数乘加；自由变量最多 3 个、系数上限 3
 | code | HTTP | 含义 |
 | --- | --- | --- |
 | `FORMULA_PARSE_ERROR` | 400 | 化学式无法解析（未知元素、括号不匹配、电荷非法等） |
-| `DUPLICATE_SPECIES` | 409 | 同一侧出现重复物种 |
-| `INVALID_REQUEST` | 422 | 请求体缺失/为空/物种过多（>100）；`/stoichiometry/batch` 投料缺失、重复、含未知物种或摩尔数非法（含 JSON 数字）；`/stoichiometry/plan` 目标重复、含非生成物物种或摩尔数非法；`/stoichiometry/yield` 投料或实际产量缺失/重复/含未知物种或任一侧摩尔数非法（实际产量侧问题在 `details.actual_yields.*`）；`/stoichiometry/sequence` 步骤为空、库存摩尔数非法（结构化错误的 `details.step` 另标出出错步骤）；`/inventory/allocate` 请求体结构问题（缺字段、空列表、日期格式错误、状态枚举非法、数字代替十进制字符串等） |
+| `DUPLICATE_SPECIES` | 409 | 同一侧出现重复物种；`/equilibrium/solve` 中同一物种跨反应两侧重复（`details.species`） |
+| `INVALID_REQUEST` | 422 | 请求体缺失/为空/物种过多（>100）；`/stoichiometry/batch` 投料缺失、重复、含未知物种或摩尔数非法（含 JSON 数字）；`/stoichiometry/plan` 目标重复、含非生成物物种或摩尔数非法；`/stoichiometry/yield` 投料或实际产量缺失/重复/含未知物种或任一侧摩尔数非法（实际产量侧问题在 `details.actual_yields.*`）；`/stoichiometry/sequence` 步骤为空、库存摩尔数非法（结构化错误的 `details.step` 另标出出错步骤）；`/equilibrium/solve` 初始量与参与物种不一一对应（`missing/duplicate/unknown`）、初始摩尔数非正或非法（`invalid_moles`）、体积非正（`invalid_volume`）或 Kc 非正（`invalid_kc`，均含 JSON 数字）；`/inventory/allocate` 请求体结构问题（缺字段、空列表、日期格式错误、状态枚举非法、数字代替十进制字符串等） |
 | `IMPOSSIBLE_BALANCE` | 422 | 守恒方程组无解（含电荷无法守恒） |
 | `NON_UNIQUE_BALANCE` | 422 | 零空间维数 > 1，配平不唯一（返回 `nullity` 与自由度） |
 | `ZERO_COEFFICIENT` | 422 | 唯一解要求某些物种系数为 0 |
@@ -1239,10 +1369,11 @@ app/
   blending.py       溶液配制：目标溶质摩尔守恒 + 可用体积/终体积约束的精确线性规划（顶点枚举），母液总量最小、再按输入顺序字典序最小，Fraction 精确计算
   isotopes.py       同位素名义质量峰分布：逐元素多项分布枚举全部计数向量（不截断零概率组合）、同质量合并、跨元素卷积，Fraction 精确计算
   hess.py           赫斯定律反应焓推导：规范物种有符号计量向量、增广矩阵有理数 RREF 判定张成/歧义、有符号（反向/分数倍）组合求解，Fraction 精确计算
+  equilibrium.py    理想溶液平衡组成：配平系数确定非负物料进度区间、Qc 浓度幂积精确比较、浮点对数种子 + 有理数包夹二分（允许负进度，绝对误差 ≤1e-10 mol）
   service.py        业务编排与响应组装
   models.py         Pydantic 请求/响应模型
   main.py           FastAPI 路由与异常处理
-tests/              解析器、配平核心、HTTP API、批量计量、反向投料规划、实际收率、连续反应推演、试剂批次领用分配、溶液配制、同位素名义质量峰分布、赫斯定律反应焓推导测试
+tests/              解析器、配平核心、HTTP API、批量计量、反向投料规划、实际收率、连续反应推演、试剂批次领用分配、溶液配制、同位素名义质量峰分布、赫斯定律反应焓推导、理想溶液平衡组成测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

@@ -28,6 +28,12 @@ from .balancer import (
 )
 from .blending import Stock, solve_blend
 from .cache import ReactionRecord, build_signature, cache, reaction_id_for, species_key
+from .equilibrium import (
+    EXTENT_TOLERANCE,
+    extent_to_decimal_string,
+    parse_positive,
+    solve_equilibrium,
+)
 from .hess import HessError, KnownReaction, normalized_by_key, solve_hess
 from .isotopes import (
     MAX_ELEMENTS,
@@ -1724,3 +1730,226 @@ def _solved_from_parts(
         coefficients=coefficients,
         elements=elements,
     )
+
+
+# ------------------------------------------------------------ 理想溶液平衡组成
+def process_equilibrium(
+    reactant_texts: list[str],
+    product_texts: list[str],
+    amount_items: list[dict[str, str]],
+    volume_text: str,
+    kc_text: str,
+) -> tuple[int, dict[str, Any]]:
+    """单个可逆反应的理想溶液平衡组成，返回 (http_status, payload)。
+
+    先复用 :func:`process_balance` 的唯一配平、规范化与幂等缓存（解析
+    失败 400、同侧重复 409、不可唯一配平 422）；此外显式拒绝**跨两侧
+    重复物种**（可逆反应两侧必须是不相交的物种集，否则平衡常数幂积
+    无定义）。随后校验初始量条目与规范化的全部参与物种一一对应、每条
+    摩尔数与体积、Kc 均为**正**十进制字符串，聚合为 422 INVALID_REQUEST。
+    校验通过后调用 :func:`app.equilibrium.solve_equilibrium`，在配平
+    系数确定的非负物料区间内求 Qc=Kc 的唯一内点（初始 Qc>Kc 时进度
+    为负），返回进度（绝对误差上界 1e-10 mol）与各物种平衡摩尔数。
+    """
+    # ---- 跨两侧重复物种：显式预检（配平会退化为 NON_UNIQUE_BALANCE，
+    # 但语义上这是非法反应，按重复物种 409 处理）
+    try:
+        reactants_pre, products_pre = _parse_all(reactant_texts, product_texts)
+    except BalanceError:
+        # 解析失败等：交给 process_balance 复用其结构化错误与缓存
+        reactants_pre = products_pre = None
+    else:
+        reactant_pre_keys = {species_key(sp) for sp in reactants_pre}
+        cross_duplicate = sorted(
+            sp.normalized
+            for sp in products_pre
+            if species_key(sp) in reactant_pre_keys
+        )
+        if cross_duplicate:
+            reaction_id = reaction_id_for(build_signature(reactants_pre, products_pre))
+            return STATUS_CODES["DUPLICATE_SPECIES"], {
+                "error": error_payload(
+                    "DUPLICATE_SPECIES",
+                    "可逆反应的同一物种不能同时出现在反应物与生成物两侧："
+                    "Qc/Kc 的浓度幂积要求两侧物种互不相交（请把物种从一侧移除"
+                    "或使用净反应式）",
+                    {"species": cross_duplicate},
+                ),
+                "reaction_id": reaction_id,
+            }
+
+    status, balance_payload = process_balance(reactant_texts, product_texts)
+    if status != 200:
+        return status, balance_payload
+
+    reaction_id = balance_payload["reaction_id"]
+    cached = balance_payload["cached"]
+
+    # parse_side 已按规范键排序，与配平向量顺序一致
+    reactants = list(parse_side(reactant_texts, "反应物"))
+    products = list(parse_side(product_texts, "生成物"))
+    coefficient_map = {
+        species_key(sp): coef
+        for sp, coef in zip(
+            (*reactants, *products), balance_payload["coefficients"]["vector"]
+        )
+    }
+    participant_keys = {species_key(sp) for sp in (*reactants, *products)}
+
+    # ---- 初始量条目：逐条解析物种与**正**摩尔数，聚合可定位的问题
+    parsed_entries: list[tuple[str, Species]] = []
+    invalid_moles: list[dict[str, str]] = []
+    initial: dict[str, Decimal] = {}
+    raw_by_key: dict[str, str] = {}
+    duplicate: list[str] = []
+    seen_keys: set[str] = set()
+
+    for item in amount_items:
+        species_text = item["species"]
+        moles_text = item["moles"]
+        try:
+            formula = parse_formula(species_text)
+        except FormulaError as exc:
+            return STATUS_CODES["FORMULA_PARSE_ERROR"], {
+                "reaction_id": reaction_id,
+                "cached": cached,
+                "error": error_payload(
+                    "FORMULA_PARSE_ERROR",
+                    str(exc),
+                    {"field": "amounts.species", "input": species_text},
+                ),
+            }
+        sp = Species(raw=species_text, normalized=formula.normalized, formula=formula)
+        key = species_key(sp)
+
+        if key in seen_keys:
+            duplicate.append(formula.normalized)
+        seen_keys.add(key)
+
+        try:
+            amount = parse_positive(moles_text, "初始摩尔数")
+        except (ValueError, InvalidOperation):
+            invalid_moles.append({"species": formula.normalized, "moles": moles_text})
+        else:
+            parsed_entries.append((moles_text, sp))
+            initial.setdefault(key, amount)
+            raw_by_key.setdefault(key, sp.raw)
+
+    unknown = sorted(
+        {sp.normalized for _, sp in parsed_entries if species_key(sp) not in participant_keys}
+    )
+    provided_keys = {species_key(sp) for _, sp in parsed_entries}
+    normalized_by_key = {
+        species_key(sp): sp.normalized for sp in (*reactants, *products)
+    }
+    missing = [
+        normalized_by_key[key] for key in participant_keys if key not in provided_keys
+    ]
+
+    # ---- 体积与 Kc：严格为正的有限十进制字符串
+    invalid_volume: str | None = None
+    invalid_kc: str | None = None
+    volume_decimal: Decimal | None = None
+    kc_decimal: Decimal | None = None
+    try:
+        volume_decimal = parse_positive(volume_text, "体积")
+    except (ValueError, InvalidOperation):
+        invalid_volume = volume_text
+    try:
+        kc_decimal = parse_positive(kc_text, "Kc")
+    except (ValueError, InvalidOperation):
+        invalid_kc = kc_text
+
+    if (
+        duplicate or unknown or missing or invalid_moles
+        or invalid_volume is not None or invalid_kc is not None
+    ):
+        details: dict[str, Any] = {}
+        if missing:
+            details["missing"] = sorted(missing)
+        if duplicate:
+            details["duplicate"] = sorted(set(duplicate))
+        if unknown:
+            details["unknown"] = unknown
+        if invalid_moles:
+            details["invalid_moles"] = invalid_moles
+        if invalid_volume is not None:
+            details["invalid_volume"] = invalid_volume
+        if invalid_kc is not None:
+            details["invalid_kc"] = invalid_kc
+        return STATUS_CODES["INVALID_REQUEST"], {
+            "reaction_id": reaction_id,
+            "cached": cached,
+            "error": error_payload(
+                "INVALID_REQUEST",
+                "初始量必须与规范化的全部反应物种一一对应（不能有缺失、重复或"
+                "未知物种），且初始摩尔数、体积与 Kc 都必须是**正**十进制字符串"
+                "（不能为 0、负数、NaN 或 JSON 数字）",
+                details,
+            ),
+        }
+
+    solution = solve_equilibrium(
+        reactants,
+        products,
+        coefficient_map,
+        initial,
+        volume_decimal,
+        kc_decimal,
+    )
+
+    # 二分区间宽度 ≤ EXTENT_TOLERANCE（中点误差 ≤ 其一半），再叠加进度
+    # 字符串的定点舍入（≤ 0.5·1e-12），总误差严格 < EXTENT_TOLERANCE
+    extent_bound = EXTENT_TOLERANCE
+    extent_value = solution.extent
+    if extent_value > 0:
+        direction = "forward"
+    elif extent_value < 0:
+        direction = "reverse"
+    else:
+        direction = "at_equilibrium"
+
+    def species_block(side: list[Species], is_reactant: bool) -> list[dict[str, Any]]:
+        blocks = []
+        for sp in side:
+            key = species_key(sp)
+            signed = -coefficient_map[key] if is_reactant else coefficient_map[key]
+            delta = signed * extent_value
+            equilibrium = solution.equilibrium_moles[key]
+            blocks.append(
+                {
+                    "input": raw_by_key.get(key, sp.raw),
+                    "normalized": sp.normalized,
+                    "coefficient": coefficient_map[key],
+                    "initial_moles": fraction_to_decimal_string(
+                        solution.initial_moles[key]
+                    ),
+                    "delta_moles": fraction_to_decimal_string(delta),
+                    "equilibrium_moles": fraction_to_decimal_string(equilibrium),
+                }
+            )
+        return blocks
+
+    return 200, {
+        "reaction_id": reaction_id,
+        "cached": cached,
+        "normalized": balance_payload["normalized"],
+        "volume_liters": fraction_to_decimal_string(
+            decimal_to_fraction(volume_decimal)
+        ),
+        "kc": fraction_to_decimal_string(decimal_to_fraction(kc_decimal)),
+        "initial_qc": fraction_to_decimal_string(solution.initial_q),
+        "reaction_extent": {
+            "value": extent_to_decimal_string(extent_value, extent_bound),
+            "unit": "mol",
+            "direction": direction,
+            "absolute_error_bound": fraction_to_decimal_string(extent_bound),
+            "feasible_range": {
+                "lower": fraction_to_decimal_string(solution.feasible_lower),
+                "upper": fraction_to_decimal_string(solution.feasible_upper),
+                "unit": "mol",
+            },
+        },
+        "reactants": species_block(reactants, True),
+        "products": species_block(products, False),
+    }
