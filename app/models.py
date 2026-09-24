@@ -219,6 +219,107 @@ class StoichiometryResponse(BaseModel):
     products: list[StoichProductResult]
 
 
+# ------------------------------------------------------------ 理想溶液平衡组成
+class EquilibriumInitialAmount(StoichAmount):
+    """平衡计算的一条初始摩尔数记录；摩尔数为**正**十进制字符串。"""
+
+    species: str = Field(
+        ...,
+        min_length=1,
+        description="参与物种化学式；必须与规范化后的反应物+生成物一一对应"
+        "（等价写法可识别），两侧均须给出",
+        examples=["H2"],
+    )
+    moles: str = Field(
+        ...,
+        min_length=1,
+        description="初始摩尔数的**正**十进制字符串（如 \"1.5\"、\"1e-3\"，"
+        "不接受 \"0\" 或负数），不要传 JSON 数字以避免浮点误差",
+        examples=["2.0"],
+    )
+
+
+class EquilibriumRequest(ReactionRequest):
+    """``/equilibrium/solve`` 请求：可逆反应式 + 全部参与物种初始摩尔数 + 体积 + Kc。"""
+
+    amounts: list[EquilibriumInitialAmount] = Field(
+        ...,
+        min_length=1,
+        description="每个参与物种（反应物 ∪ 生成物）一条初始摩尔数记录；"
+        "数量必须恰好等于规范化物种总数，且 species 一一对应"
+        "（无缺失、重复、未知物种，同一物种不得同时出现在两侧），"
+        "摩尔数必须严格为正",
+    )
+    volume_l: str = Field(
+        ...,
+        min_length=1,
+        description="溶液体积，单位 L，**正**十进制字符串（如 \"2.0\"、\"0.5\"），"
+        "不要传 JSON 数字",
+        examples=["1.0"],
+    )
+    kc: str = Field(
+        ...,
+        min_length=1,
+        description="浓度平衡常数 Kc（无量纲或以 mol/L 约定），**正**十进制"
+        "字符串（如 \"4.0\"、\"1e-3\"），不要传 JSON 数字",
+        examples=["1.0"],
+    )
+
+    @field_validator("volume_l", "kc")
+    @classmethod
+    def _strip_positive_text(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("必须是字符串")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("不能为空白字符串")
+        return stripped
+
+
+class EquilibriumSpeciesResult(BaseModel):
+    input: str = Field(description="客户端提交的原始化学式")
+    normalized: str = Field(description="规范化后的化学式")
+    coefficient: int = Field(description="最小互质正整数配平系数")
+    initial_moles: str = Field(description="客户端提交的初始摩尔数（回显）")
+    equilibrium_moles: str = Field(
+        description="平衡摩尔数 = 初始摩尔数 − 生成物计量变化 / + 反应物计量"
+        "变化（mol，非负）"
+    )
+
+
+class EquilibriumExtentBounds(BaseModel):
+    minimum: str = Field(
+        description="非负物料区间下界 ξ_min = −min_生成物(初始量 ÷ 系数) ≤ 0（mol）"
+    )
+    maximum: str = Field(
+        description="非负物料区间上界 ξ_max = min_反应物(初始量 ÷ 系数) ≥ 0（mol）"
+    )
+
+
+class EquilibriumResponse(BaseModel):
+    reaction_id: str
+    cached: bool = Field(description="配平结果是否命中幂等缓存")
+    normalized: NormalizedReaction
+    volume_l: str = Field(description="溶液体积（L，回显）")
+    kc: str = Field(description="浓度平衡常数（回显）")
+    direction: Literal["forward", "reverse", "at_equilibrium"] = Field(
+        description="平衡移动方向：forward 正向（ξ>0）/ reverse 逆向（ξ<0，"
+        "初始 Qc>Kc）/ at_equilibrium 初始即平衡（ξ=0）"
+    )
+    reaction_extent: ReactionExtent
+    extent_bounds: EquilibriumExtentBounds = Field(
+        description="由配平系数与初始量确定的非负物料区间 [ξ_min, ξ_max]"
+    )
+    initial_qc: str = Field(
+        description="按初始浓度计量次方构造的反应商 Qc(0)（十进制字符串）"
+    )
+    equilibrium_qc: str = Field(
+        description="按返回平衡组成构造的反应商，应与 Kc 一致（十进制字符串）"
+    )
+    reactants: list[EquilibriumSpeciesResult]
+    products: list[EquilibriumSpeciesResult]
+
+
 # ------------------------------------------------------------ 实际收率
 class ActualYield(StoichAmount):
     """一条生成物实际摩尔产量记录；复用非负十进制字符串摩尔数校验。"""

@@ -15,6 +15,10 @@
 * ``POST /stoichiometry/sequence`` 多步连续反应推演：按顺序执行多步
   反应，基于初始物种库存逐步计算最大反应进度、扣减消耗、加入产物，
   返回各步明细与最终库存；
+* ``POST /equilibrium/solve`` 理想溶液平衡组成：单个可逆反应 + 各参与
+  物种正初始摩尔数 + 体积（L）与 Kc，按配平系数确定双向非负物料区间，
+  在区间内对 Qc(ξ)=Kc 二分求唯一内点反应进度（初始 Qc>Kc 时取负进度），
+  返回进度、物料区间与各物种平衡摩尔数（绝对误差上界 1e-9 mol）；
 * ``POST /inventory/allocate`` 试剂批次 FEFO 领用分配：按失效日期优先、
   同日批号升序跨批次扣减（名义量×纯度换算有效物质），跳过过期/隔离批次，
   返回每批领用/余量、未满足需求与汇总状态；
@@ -48,6 +52,8 @@ from .models import (
     BalanceResponse,
     BlendRequest,
     BlendResponse,
+    EquilibriumRequest,
+    EquilibriumResponse,
     HessRequest,
     HessResponse,
     IsotopeEnvelopeRequest,
@@ -71,6 +77,7 @@ from .service import (
     process_analyze,
     process_balance,
     process_blend,
+    process_equilibrium,
     process_hess,
     process_isotope_envelope,
     process_reverse_plan,
@@ -224,6 +231,29 @@ async def stoichiometry_yield(request: YieldRequest):
         request.products,
         [item.model_dump() for item in request.amounts],
         [item.model_dump() for item in request.actual_yields],
+    )
+    return JSONResponse(status_code=status, content=payload)
+
+
+@app.post(
+    "/api/v1/equilibrium/solve",
+    response_model=EquilibriumResponse,
+    tags=["平衡"],
+    summary="理想溶液平衡组成：Qc=Kc 的唯一内点反应进度与各物种平衡摩尔数",
+    responses={
+        400: {"description": "化学式或初始量物种无法解析"},
+        409: {"description": "同侧重复物种"},
+        422: {"description": "无法唯一配平 / 初始量与物种不一一对应 / 两侧重复物种 / "
+                            "初始摩尔数、体积或 Kc 非正十进制字符串"},
+    },
+)
+async def equilibrium_solve(request: EquilibriumRequest):
+    status, payload = process_equilibrium(
+        request.reactants,
+        request.products,
+        [item.model_dump() for item in request.amounts],
+        request.volume_l,
+        request.kc,
     )
     return JSONResponse(status_code=status, content=payload)
 

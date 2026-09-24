@@ -76,6 +76,18 @@ def decimal_to_fraction(value: Decimal) -> Fraction:
     return Fraction(numerator, 10**-exponent)
 
 
+def parse_positive_moles(text: str) -> Decimal:
+    """把十进制字符串解析为**严格为正**的有限 :class:`Decimal`。
+
+    与 :func:`parse_moles` 的区别仅在于拒绝 0 与负零写法（平衡组成要求
+    各参与物种初始摩尔数、体积与 Kc 严格为正，以保证 Qc=Kc 存在唯一内点）。
+    """
+    value = parse_moles(text)
+    if value == 0:
+        raise ValueError("数值必须严格为正，不能为 0")
+    return value
+
+
 def parse_enthalpy(text: str) -> Decimal:
     """把反应焓十进制字符串解析为**可带符号**的有限 :class:`Decimal`。
 
@@ -130,18 +142,31 @@ def _fixed_point(decimal_value: Decimal) -> str:
     return ("-" if sign and digit_text != "0" else "") + (body or "0")
 
 
-def fraction_to_decimal_string(value: Fraction) -> str:
+def fraction_to_decimal_string(
+    value: Fraction, *, min_absolute_accuracy: Decimal | None = None
+) -> str:
     """把精确有理数量渲染为十进制字符串。
 
     分母约分后只含 2、5 因子时输出精确有限小数；否则按
     :data:`SIGNIFICANT_DIGITS` 位有效数字舍入（ROUND_HALF_EVEN）。
     始终使用定点记法（不出现科学计数法），并去掉多余的尾随零。
+
+    给定 ``min_absolute_accuracy`` 时，对大数量级值追加有效位数，使
+    渲染引入的绝对舍入误差严格小于该阈值（如平衡进度的 1e-10 mol）。
     """
     if value == 0:
         return "0"
     denominator = value.denominator
     terminating = _is_terminating(denominator)
     places = _terminating_places(denominator) if terminating else 0
+
+    extra_prec = 0
+    if min_absolute_accuracy is not None and not terminating:
+        # 总有效位 = 整数位数 + 阈值要求的小数位数（1e-20 -> 20 位小数），
+        # 使大数量级值的绝对舍入误差小于阈值
+        integer_digits = max(len(str(value.numerator)) - len(str(denominator)) + 1, 1)
+        required_places = max(0, -min_absolute_accuracy.as_tuple().exponent)
+        extra_prec = max(0, integer_digits + required_places - SIGNIFICANT_DIGITS)
 
     with localcontext() as ctx:
         if terminating:
@@ -152,9 +177,38 @@ def fraction_to_decimal_string(value: Fraction) -> str:
             if places:
                 decimal_value = decimal_value.quantize(Decimal(1).scaleb(-places))
         else:
-            ctx.prec = SIGNIFICANT_DIGITS
+            ctx.prec = SIGNIFICANT_DIGITS + extra_prec
             decimal_value = Decimal(value.numerator) / Decimal(denominator)
     return _fixed_point(decimal_value)
+
+
+def decimal_to_string(
+    value: Decimal, *, min_absolute_accuracy: Decimal | None = None
+) -> str:
+    """把高精度 :class:`Decimal` 渲染为定点十进制字符串。
+
+    默认按 28 位有效数字舍入；给定 ``min_absolute_accuracy``（如
+    平衡进度要求的 1e-10 mol）时，对大数量级值自动追加精度，使渲染
+    引入的绝对舍入误差严格小于该阈值。用于以 Decimal 二分得到的平衡
+    结果；输出规则（定点记法、去尾随零）与
+    :func:`fraction_to_decimal_string` 保持一致。
+    """
+    with localcontext() as ctx:
+        ctx.prec = SIGNIFICANT_DIGITS
+        rounded = +value
+        if min_absolute_accuracy is not None and value != 0:
+            # 总有效位 = 整数位数 + 阈值小数位（大数量级时自动追加）
+            integer_digits = value.adjusted() + 1
+            required_places = max(
+                0, -min_absolute_accuracy.as_tuple().exponent
+            )
+            required_prec = max(
+                SIGNIFICANT_DIGITS, integer_digits + required_places
+            )
+            if required_prec > SIGNIFICANT_DIGITS:
+                ctx.prec = required_prec
+                rounded = +value
+    return _fixed_point(rounded)
 
 
 def _extent_and_limiting(
